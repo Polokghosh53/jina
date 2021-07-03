@@ -1,7 +1,8 @@
 import argparse
 import asyncio
 from abc import ABC
-from typing import AsyncGenerator
+from asyncio import Future
+from typing import AsyncGenerator, Dict
 
 from ....helper import typename
 from ....logging.logger import JinaLogger
@@ -15,6 +16,21 @@ if False:
 
 class PrefetchMixin(ABC):
     """JinaRPCServicer """
+
+    def __init__(self):
+        self._message_buffer: Dict[str, Future[Message]] = dict()
+        asyncio.create_task(self._receive())
+
+    async def _receive(self):
+        while True:
+            message = await self.zmqlet.recv_message(callback=lambda x: x.response)
+            if message.request_id in self._message_buffer:
+                self._message_buffer[message.request_id].set_result(message)
+                del self._message_buffer[message.request_id]
+            else:
+                self.logger.warning(
+                    f'Discarding unexpected message with request id {message.request_id}'
+                )
 
     async def Call(self, request_iterator, *args) -> AsyncGenerator[None, Message]:
         """
@@ -46,16 +62,16 @@ class PrefetchMixin(ABC):
                         raise TypeError(
                             f'{typename(request_iterator)} does not have `__anext__` or `__next__`'
                         )
+
+                    future = Future()
+                    self._message_buffer[next_request.request_id] = future
                     asyncio.create_task(
                         self.zmqlet.send_message(
                             Message(None, next_request, 'gateway', **vars(self.args))
                         )
                     )
-                    fetch_to.append(
-                        asyncio.create_task(
-                            self.zmqlet.recv_message(callback=lambda x: x.response)
-                        )
-                    )
+
+                    fetch_to.append(future)
                 except (StopIteration, StopAsyncIteration):
                     return True
             return False
@@ -110,4 +126,5 @@ class PrefetchCaller(PrefetchMixin):
         self.args = args
         self.zmqlet = zmqlet
         self.name = args.name or self.__class__.__name__
+
         self.logger = JinaLogger(self.name, **vars(args))
